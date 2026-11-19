@@ -4,7 +4,7 @@ import fs from "fs";
 import http from "http";
 import path from "path";
 import { fileURLToPath } from "url";
-import { GoogleGenAI, Modality } from "@google/genai";
+import { GoogleGenAI, Modality, ThinkingLevel } from "@google/genai";
 import type { LiveServerMessage } from "@google/genai";
 import { WebSocketServer, WebSocket } from "ws";
 
@@ -117,6 +117,7 @@ function getAiClient(): GoogleGenAI | null {
   return new GoogleGenAI({
     apiKey,
     httpOptions: {
+      apiVersion: "v1beta",
       headers: {
         "User-Agent": "aistudio-build",
       },
@@ -177,13 +178,37 @@ async function startServer() {
 
       const langNote = `\nPreferred default language for this session: ${LANGUAGE_LABELS[requestedLang]}. If the user writes in English, French, or Arabic, respond in the language of their question.`;
 
-      const response = await ai.models.generateContent({
-        model: "gemini-4-hydrogen",
-        contents,
-        config: {
-          systemInstruction: LAILA_RESUME_SYSTEM_INSTRUCTION + langNote,
-        },
-      });
+      let response;
+      let lastErr: unknown = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          response = await ai.models.generateContent({
+            model: "gemini-4-hydrogen",
+            contents,
+            config: {
+              systemInstruction: LAILA_RESUME_SYSTEM_INSTRUCTION + langNote,
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            },
+          });
+          break;
+        } catch (err) {
+          lastErr = err;
+          const msg = err instanceof Error ? err.message : "";
+          const isTransient =
+            msg.includes("503") ||
+            msg.includes("429") ||
+            msg.includes("UNAVAILABLE") ||
+            msg.includes("RESOURCE_EXHAUSTED");
+          if (!isTransient || attempt === 2) {
+            throw err;
+          }
+          await new Promise((r) => setTimeout(r, 700 * (attempt + 1)));
+        }
+      }
+
+      if (!response) {
+        throw lastErr instanceof Error ? lastErr : new Error("Request failed.");
+      }
 
       const answer = response.text?.replace(/\u2014/g, ", ").trim();
       if (!answer) {
@@ -195,9 +220,13 @@ async function startServer() {
 
       res.json({ answer });
     } catch (err) {
-      const message =
+      const raw =
         err instanceof Error ? err.message : "Failed to generate answer.";
-      res.status(500).json({ error: message });
+      const friendly =
+        raw.includes("503") || raw.includes("UNAVAILABLE")
+          ? "The text Q&A service is experiencing a temporary spike in demand. Please try again in a moment, or start a live voice interview."
+          : raw;
+      res.status(500).json({ error: friendly });
     }
   });
 

@@ -261,8 +261,18 @@ export function useVoiceAgent() {
         });
         streamRef.current = stream;
 
-        const inputCtx = new AudioContext({ sampleRate: 16000 });
-        const outputCtx = new AudioContext({ sampleRate: 24000 });
+        let inputCtx: AudioContext;
+        try {
+          inputCtx = new AudioContext({ sampleRate: 16000 });
+        } catch {
+          inputCtx = new AudioContext();
+        }
+        let outputCtx: AudioContext;
+        try {
+          outputCtx = new AudioContext({ sampleRate: 24000 });
+        } catch {
+          outputCtx = new AudioContext();
+        }
         await inputCtx.resume();
         await outputCtx.resume();
 
