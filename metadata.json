@@ -1,0 +1,6 @@
+{
+  "name": "Laila Zohdy — Interactive Voice Resume",
+  "description": "Interactive executive resume and real-time voice agent for Laila Zohdy, Communications & Marketing Project Manager based in Paris.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
