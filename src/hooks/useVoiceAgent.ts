@@ -12,6 +12,17 @@ export interface TranscriptEntry {
   isStreaming?: boolean;
 }
 
+interface LiveServerEvent {
+  ready?: boolean;
+  audio?: string;
+  inputTranscript?: string;
+  outputTranscript?: string;
+  turnComplete?: boolean;
+  interrupted?: boolean;
+  error?: string;
+  sessionClosed?: boolean;
+}
+
 function downsampleTo16k(input: Float32Array, inputSampleRate: number): Float32Array {
   if (inputSampleRate === 16000) return input;
   const ratio = inputSampleRate / 16000;
@@ -25,6 +36,20 @@ function downsampleTo16k(input: Float32Array, inputSampleRate: number): Float32A
     output[i] = input[idx0] * (1 - frac) + input[idx1] * frac;
   }
   return output;
+}
+
+function concatFloat32Arrays(chunks: Float32Array[]): Float32Array {
+  let totalLength = 0;
+  for (const chunk of chunks) {
+    totalLength += chunk.length;
+  }
+  const merged = new Float32Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return merged;
 }
 
 function float32ToPcm16Base64(float32: Float32Array): string {
@@ -71,6 +96,12 @@ export function useVoiceAgent() {
   const [isTextThinking, setIsTextThinking] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
+  const httpSessionIdRef = useRef<string | null>(null);
+  const httpAbortRef = useRef<AbortController | null>(null);
+  const transportModeRef = useRef<"ws" | "http" | null>(null);
+  const pendingPcmChunksRef = useRef<Float32Array[]>([]);
+  const httpFlushInFlightRef = useRef(false);
+
   const isMutedRef = useRef(false);
   const statusRef = useRef<VoiceStatus>("idle");
   const languageRef = useRef<VoiceLanguage>("en");
@@ -111,7 +142,7 @@ export function useVoiceAgent() {
     setAgentLevel(0);
   }, []);
 
-  const cleanupAudioAndSocket = useCallback(() => {
+  const cleanupAudioAndTransport = useCallback(() => {
     if (animFrameRef.current !== null) {
       cancelAnimationFrame(animFrameRef.current);
       animFrameRef.current = null;
@@ -155,6 +186,23 @@ export function useVoiceAgent() {
       }
     }
 
+    if (httpAbortRef.current) {
+      httpAbortRef.current.abort();
+      httpAbortRef.current = null;
+    }
+
+    if (httpSessionIdRef.current) {
+      const sid = httpSessionIdRef.current;
+      httpSessionIdRef.current = null;
+      fetch(`/api/live/stop/${encodeURIComponent(sid)}`, {
+        method: "POST",
+      }).catch(() => {});
+    }
+
+    transportModeRef.current = null;
+    pendingPcmChunksRef.current = [];
+    httpFlushInFlightRef.current = false;
+
     setUserLevel(0);
     setAgentLevel(0);
     setAgentSpeaking(false);
@@ -162,9 +210,9 @@ export function useVoiceAgent() {
 
   useEffect(() => {
     return () => {
-      cleanupAudioAndSocket();
+      cleanupAudioAndTransport();
     };
-  }, [cleanupAudioAndSocket]);
+  }, [cleanupAudioAndTransport]);
 
   const appendTranscriptDelta = useCallback(
     (role: "user" | "agent", delta: string) => {
@@ -238,6 +286,208 @@ export function useVoiceAgent() {
     };
   }, []);
 
+  const handleServerEvent = useCallback(
+    (msg: LiveServerEvent) => {
+      if (msg.ready) {
+        setStatus("connected");
+      }
+      if (msg.error) {
+        setErrorMessage(msg.error);
+        setStatus("error");
+        cleanupAudioAndTransport();
+        return;
+      }
+      if (msg.interrupted) {
+        stopPlayback();
+        finalizeStreamingTurn();
+      }
+      if (msg.inputTranscript) {
+        appendTranscriptDelta("user", msg.inputTranscript);
+      }
+      if (msg.outputTranscript) {
+        appendTranscriptDelta("agent", msg.outputTranscript);
+      }
+      if (msg.audio) {
+        playAudioChunk(msg.audio);
+      }
+      if (msg.turnComplete) {
+        finalizeStreamingTurn();
+      }
+      if (msg.sessionClosed) {
+        finalizeStreamingTurn();
+        setStatus("idle");
+        cleanupAudioAndTransport();
+      }
+    },
+    [
+      appendTranscriptDelta,
+      cleanupAudioAndTransport,
+      finalizeStreamingTurn,
+      playAudioChunk,
+      stopPlayback,
+    ]
+  );
+
+  const flushHttpAudio = useCallback(async () => {
+    if (
+      httpFlushInFlightRef.current ||
+      transportModeRef.current !== "http" ||
+      !httpSessionIdRef.current ||
+      pendingPcmChunksRef.current.length === 0
+    ) {
+      return;
+    }
+
+    httpFlushInFlightRef.current = true;
+    try {
+      while (
+        transportModeRef.current === "http" &&
+        httpSessionIdRef.current &&
+        pendingPcmChunksRef.current.length > 0
+      ) {
+        const chunks = pendingPcmChunksRef.current;
+        pendingPcmChunksRef.current = [];
+        const merged = concatFloat32Arrays(chunks);
+        const base64Audio = float32ToPcm16Base64(merged);
+        const sid = httpSessionIdRef.current;
+        if (!sid) break;
+
+        await fetch(`/api/live/input/${encodeURIComponent(sid)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ audio: base64Audio }),
+        });
+      }
+    } catch {
+      // Transport closed or interrupted
+    } finally {
+      httpFlushInFlightRef.current = false;
+    }
+  }, []);
+
+  const sendControlPayload = useCallback(
+    async (payload: { text?: string; switchLanguage?: VoiceLanguage }) => {
+      if (
+        transportModeRef.current === "ws" &&
+        wsRef.current &&
+        wsRef.current.readyState === WebSocket.OPEN
+      ) {
+        wsRef.current.send(JSON.stringify(payload));
+        return;
+      }
+
+      if (transportModeRef.current === "http" && httpSessionIdRef.current) {
+        await fetch(
+          `/api/live/input/${encodeURIComponent(httpSessionIdRef.current)}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          }
+        );
+      }
+    },
+    []
+  );
+
+  const startHttpFallbackSession = useCallback(
+    async (activeVoice: VoicePersona, activeLang: VoiceLanguage) => {
+      const startRes = await fetch("/api/live/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ voice: activeVoice, lang: activeLang }),
+      });
+
+      const startData = (await startRes.json()) as {
+        sessionId?: string;
+        error?: string;
+      };
+
+      if (!startRes.ok || !startData.sessionId) {
+        throw new Error(
+          startData.error || "Unable to initialize the voice session."
+        );
+      }
+
+      const sessionId = startData.sessionId;
+      if (statusRef.current === "idle") {
+        fetch(`/api/live/stop/${encodeURIComponent(sessionId)}`, {
+          method: "POST",
+        }).catch(() => {});
+        return;
+      }
+      httpSessionIdRef.current = sessionId;
+      transportModeRef.current = "http";
+
+      const abortController = new AbortController();
+      httpAbortRef.current = abortController;
+
+      setStatus("connected");
+
+      // Read SSE stream via fetch (proxied seamlessly through AI Studio iframe bridge)
+      void (async () => {
+        try {
+          const streamRes = await fetch(
+            `/api/live/stream/${encodeURIComponent(sessionId)}`,
+            {
+              headers: { Accept: "text/event-stream" },
+              signal: abortController.signal,
+            }
+          );
+
+          if (!streamRes.ok || !streamRes.body) {
+            throw new Error("Voice audio stream interrupted.");
+          }
+
+          const reader = streamRes.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+
+            const events = buffer.split("\n\n");
+            buffer = events.pop() ?? "";
+
+            for (const block of events) {
+              for (const line of block.split("\n")) {
+                if (line.startsWith("data:")) {
+                  const jsonStr = line.slice(5).trim();
+                  if (!jsonStr) continue;
+                  try {
+                    const parsed = JSON.parse(jsonStr) as LiveServerEvent;
+                    handleServerEvent(parsed);
+                  } catch {
+                    // Ignore malformed SSE lines
+                  }
+                }
+              }
+            }
+          }
+        } catch (err) {
+          if (
+            err instanceof Error &&
+            err.name === "AbortError"
+          ) {
+            return;
+          }
+          if (statusRef.current === "connected" || statusRef.current === "connecting") {
+            setErrorMessage(
+              err instanceof Error
+                ? err.message
+                : "Voice stream disconnected unexpectedly."
+            );
+            setStatus("error");
+            cleanupAudioAndTransport();
+          }
+        }
+      })();
+    },
+    [cleanupAudioAndTransport, handleServerEvent]
+  );
+
   const startSession = useCallback(
     async (selectedVoice?: VoicePersona, selectedLang?: VoiceLanguage) => {
       const activeVoice = selectedVoice ?? voiceName;
@@ -284,11 +534,48 @@ export function useVoiceAgent() {
         outputCtxRef.current = outputCtx;
         analyserRef.current = analyser;
 
-        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const ws = new WebSocket(
-          `${protocol}//${window.location.host}/live?voice=${encodeURIComponent(activeVoice)}&lang=${encodeURIComponent(activeLang)}`
-        );
-        wsRef.current = ws;
+        // Wire mic processor once for whichever transport succeeds
+        const source = inputCtx.createMediaStreamSource(stream);
+        const processor = inputCtx.createScriptProcessor(4096, 1, 1);
+        processorRef.current = processor;
+
+        const silentGain = inputCtx.createGain();
+        silentGain.gain.value = 0;
+
+        source.connect(processor);
+        processor.connect(silentGain);
+        silentGain.connect(inputCtx.destination);
+
+        processor.onaudioprocess = (event) => {
+          if (isMutedRef.current) {
+            setUserLevel(0);
+            return;
+          }
+          const rawChannel = event.inputBuffer.getChannelData(0);
+          let sumSq = 0;
+          for (let i = 0; i < rawChannel.length; i++) {
+            sumSq += rawChannel[i] * rawChannel[i];
+          }
+          const rms = Math.sqrt(sumSq / rawChannel.length);
+          setUserLevel(Math.min(1, rms * 5.5));
+
+          const pcm16k = downsampleTo16k(rawChannel, inputCtx.sampleRate);
+
+          if (
+            transportModeRef.current === "ws" &&
+            wsRef.current &&
+            wsRef.current.readyState === WebSocket.OPEN
+          ) {
+            const base64Audio = float32ToPcm16Base64(pcm16k);
+            wsRef.current.send(JSON.stringify({ audio: base64Audio }));
+          } else if (
+            transportModeRef.current === "http" &&
+            httpSessionIdRef.current
+          ) {
+            pendingPcmChunksRef.current.push(new Float32Array(pcm16k));
+            void flushHttpAudio();
+          }
+        };
 
         const freqData = new Uint8Array(analyser.frequencyBinCount);
         const updateMeter = () => {
@@ -307,99 +594,80 @@ export function useVoiceAgent() {
         };
         animFrameRef.current = requestAnimationFrame(updateMeter);
 
+        // Try direct WebSocket first; if blocked by iframe/proxy cookie checks before ready, fall back transparently to HTTP fetch streaming
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const ws = new WebSocket(
+          `${protocol}//${window.location.host}/live?voice=${encodeURIComponent(activeVoice)}&lang=${encodeURIComponent(activeLang)}`
+        );
+        wsRef.current = ws;
+
+        let wsReady = false;
+        let fellBackToHttp = false;
+
+        const triggerHttpFallback = async () => {
+          if (fellBackToHttp || statusRef.current === "idle") return;
+          fellBackToHttp = true;
+          wsRef.current = null;
+          try {
+            ws.close();
+          } catch {
+            // Ignore close errors
+          }
+          try {
+            await startHttpFallbackSession(activeVoice, activeLang);
+          } catch (err) {
+            setErrorMessage(
+              err instanceof Error
+                ? err.message
+                : "Unable to establish the real-time voice connection."
+            );
+            setStatus("error");
+            cleanupAudioAndTransport();
+          }
+        };
+
         ws.onopen = () => {
-          const source = inputCtx.createMediaStreamSource(stream);
-          const processor = inputCtx.createScriptProcessor(4096, 1, 1);
-          processorRef.current = processor;
-
-          const silentGain = inputCtx.createGain();
-          silentGain.gain.value = 0;
-
-          source.connect(processor);
-          processor.connect(silentGain);
-          silentGain.connect(inputCtx.destination);
-
-          processor.onaudioprocess = (event) => {
-            if (isMutedRef.current || ws.readyState !== WebSocket.OPEN) {
-              setUserLevel(0);
-              return;
-            }
-            const rawChannel = event.inputBuffer.getChannelData(0);
-            let sumSq = 0;
-            for (let i = 0; i < rawChannel.length; i++) {
-              sumSq += rawChannel[i] * rawChannel[i];
-            }
-            const rms = Math.sqrt(sumSq / rawChannel.length);
-            setUserLevel(Math.min(1, rms * 5.5));
-
-            const pcm16k = downsampleTo16k(rawChannel, inputCtx.sampleRate);
-            const base64Audio = float32ToPcm16Base64(pcm16k);
-            ws.send(JSON.stringify({ audio: base64Audio }));
-          };
+          transportModeRef.current = "ws";
         };
 
         ws.onmessage = (event) => {
           try {
-            const msg = JSON.parse(event.data) as {
-              ready?: boolean;
-              audio?: string;
-              inputTranscript?: string;
-              outputTranscript?: string;
-              turnComplete?: boolean;
-              interrupted?: boolean;
-              error?: string;
-              sessionClosed?: boolean;
-            };
-
+            const msg = JSON.parse(event.data) as LiveServerEvent;
             if (msg.ready) {
-              setStatus("connected");
+              wsReady = true;
             }
-            if (msg.error) {
-              setErrorMessage(msg.error);
-              setStatus("error");
-              cleanupAudioAndSocket();
-              return;
-            }
-            if (msg.interrupted) {
-              stopPlayback();
-              finalizeStreamingTurn();
-            }
-            if (msg.inputTranscript) {
-              appendTranscriptDelta("user", msg.inputTranscript);
-            }
-            if (msg.outputTranscript) {
-              appendTranscriptDelta("agent", msg.outputTranscript);
-            }
-            if (msg.audio) {
-              playAudioChunk(msg.audio);
-            }
-            if (msg.turnComplete) {
-              finalizeStreamingTurn();
-            }
-            if (msg.sessionClosed) {
-              finalizeStreamingTurn();
-              setStatus("idle");
-              cleanupAudioAndSocket();
-            }
+            handleServerEvent(msg);
           } catch {
-            // Ignore unparseable messages
+            // Ignore unparseable frames
           }
         };
 
         ws.onerror = () => {
-          setErrorMessage(
-            "Unable to establish the real-time voice connection. Please verify microphone access or try text mode."
-          );
-          setStatus("error");
-          cleanupAudioAndSocket();
+          if (!wsReady && !fellBackToHttp) {
+            void triggerHttpFallback();
+            return;
+          }
+          if (!fellBackToHttp) {
+            setErrorMessage(
+              "Unable to establish the real-time voice connection. Please verify microphone access or try text mode."
+            );
+            setStatus("error");
+            cleanupAudioAndTransport();
+          }
         };
 
         ws.onclose = () => {
-          finalizeStreamingTurn();
-          if (statusRef.current !== "error") {
-            setStatus("idle");
+          if (!wsReady && !fellBackToHttp && statusRef.current === "connecting") {
+            void triggerHttpFallback();
+            return;
           }
-          cleanupAudioAndSocket();
+          if (!fellBackToHttp && transportModeRef.current === "ws") {
+            finalizeStreamingTurn();
+            if (statusRef.current !== "error") {
+              setStatus("idle");
+            }
+            cleanupAudioAndTransport();
+          }
         };
       } catch (err) {
         const message =
@@ -410,15 +678,15 @@ export function useVoiceAgent() {
               : "Could not access your microphone.";
         setErrorMessage(message);
         setStatus("error");
-        cleanupAudioAndSocket();
+        cleanupAudioAndTransport();
       }
     },
     [
-      appendTranscriptDelta,
-      cleanupAudioAndSocket,
+      cleanupAudioAndTransport,
       finalizeStreamingTurn,
-      playAudioChunk,
-      stopPlayback,
+      flushHttpAudio,
+      handleServerEvent,
+      startHttpFallbackSession,
       voiceName,
     ]
   );
@@ -426,8 +694,8 @@ export function useVoiceAgent() {
   const stopSession = useCallback(() => {
     finalizeStreamingTurn();
     setStatus("idle");
-    cleanupAudioAndSocket();
-  }, [cleanupAudioAndSocket, finalizeStreamingTurn]);
+    cleanupAudioAndTransport();
+  }, [cleanupAudioAndTransport, finalizeStreamingTurn]);
 
   const toggleMute = useCallback(() => {
     const next = !isMutedRef.current;
@@ -446,17 +714,16 @@ export function useVoiceAgent() {
     [stopSession]
   );
 
-  const changeLanguage = useCallback((nextLang: VoiceLanguage) => {
-    setLanguage(nextLang);
-    languageRef.current = nextLang;
-    if (
-      statusRef.current === "connected" &&
-      wsRef.current &&
-      wsRef.current.readyState === WebSocket.OPEN
-    ) {
-      wsRef.current.send(JSON.stringify({ switchLanguage: nextLang }));
-    }
-  }, []);
+  const changeLanguage = useCallback(
+    (nextLang: VoiceLanguage) => {
+      setLanguage(nextLang);
+      languageRef.current = nextLang;
+      if (statusRef.current === "connected") {
+        void sendControlPayload({ switchLanguage: nextLang });
+      }
+    },
+    [sendControlPayload]
+  );
 
   const askQuestion = useCallback(
     async (question: string) => {
@@ -464,11 +731,7 @@ export function useVoiceAgent() {
       if (!trimmed) return;
       setErrorMessage(null);
 
-      if (
-        statusRef.current === "connected" &&
-        wsRef.current &&
-        wsRef.current.readyState === WebSocket.OPEN
-      ) {
+      if (statusRef.current === "connected" && transportModeRef.current) {
         finalizeStreamingTurn();
         setTranscript((prev) => [
           ...prev,
@@ -479,7 +742,7 @@ export function useVoiceAgent() {
             mode: "text",
           },
         ]);
-        wsRef.current.send(JSON.stringify({ text: trimmed }));
+        await sendControlPayload({ text: trimmed });
         return;
       }
 
@@ -534,7 +797,7 @@ export function useVoiceAgent() {
         setIsTextThinking(false);
       }
     },
-    [finalizeStreamingTurn]
+    [finalizeStreamingTurn, sendControlPayload]
   );
 
   const clearTranscript = useCallback(() => {
