@@ -23,7 +23,32 @@ interface LiveServerEvent {
   sessionClosed?: boolean;
 }
 
-async function readJsonSafe<T>(res: Response): Promise<{ ok: boolean; status: number; data: T | null; rawText: string }> {
+interface GeminiBidiMessage {
+  setupComplete?: Record<string, unknown>;
+  error?: { message?: string; code?: number };
+  serverContent?: {
+    interrupted?: boolean;
+    turnComplete?: boolean;
+    inputTranscription?: { text?: string };
+    outputTranscription?: { text?: string };
+    modelTurn?: {
+      parts?: Array<{
+        inlineData?: { data?: string; mimeType?: string };
+        text?: string;
+      }>;
+    };
+  };
+}
+
+const LANGUAGE_LABELS: Record<VoiceLanguage, string> = {
+  en: "English",
+  fr: "French",
+  ar: "Arabic",
+};
+
+async function readJsonSafe<T>(
+  res: Response
+): Promise<{ ok: boolean; status: number; data: T | null; rawText: string }> {
   const rawText = await res.text();
   try {
     const data = JSON.parse(rawText) as T;
@@ -31,6 +56,14 @@ async function readJsonSafe<T>(res: Response): Promise<{ ok: boolean; status: nu
   } catch {
     return { ok: false, status: res.status, data: null, rawText };
   }
+}
+
+async function decodeWsPayload(data: unknown): Promise<string> {
+  if (typeof data === "string") return data;
+  if (data instanceof Blob) return await data.text();
+  if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
+  if (ArrayBuffer.isView(data)) return new TextDecoder().decode(data);
+  return "";
 }
 
 function downsampleTo16k(input: Float32Array, inputSampleRate: number): Float32Array {
@@ -106,9 +139,13 @@ export function useVoiceAgent() {
   const [isTextThinking, setIsTextThinking] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
+  const wsReadyRef = useRef(false);
+  const micStreamReadyRef = useRef(false);
+  const micEnableTimerRef = useRef<number | null>(null);
+  const wsMessageQueueRef = useRef<Promise<void>>(Promise.resolve());
   const httpSessionIdRef = useRef<string | null>(null);
   const httpAbortRef = useRef<AbortController | null>(null);
-  const transportModeRef = useRef<"ws" | "http" | null>(null);
+  const transportModeRef = useRef<"gemini-ws" | "http" | null>(null);
   const pendingPcmChunksRef = useRef<Float32Array[]>([]);
   const httpFlushInFlightRef = useRef(false);
 
@@ -188,6 +225,12 @@ export function useVoiceAgent() {
       analyserRef.current = null;
     }
 
+    wsReadyRef.current = false;
+    micStreamReadyRef.current = false;
+    if (micEnableTimerRef.current !== null) {
+      window.clearTimeout(micEnableTimerRef.current);
+      micEnableTimerRef.current = null;
+    }
     if (wsRef.current) {
       const ws = wsRef.current;
       wsRef.current = null;
@@ -315,7 +358,10 @@ export function useVoiceAgent() {
         appendTranscriptDelta("user", msg.inputTranscript);
       }
       if (msg.outputTranscript) {
-        appendTranscriptDelta("agent", msg.outputTranscript);
+        appendTranscriptDelta(
+          "agent",
+          msg.outputTranscript.replace(/\u2014/g, ", ")
+        );
       }
       if (msg.audio) {
         playAudioChunk(msg.audio);
@@ -377,12 +423,34 @@ export function useVoiceAgent() {
 
   const sendControlPayload = useCallback(
     async (payload: { text?: string; switchLanguage?: VoiceLanguage }) => {
+      const promptText = payload.switchLanguage
+        ? `Please acknowledge briefly in ${LANGUAGE_LABELS[payload.switchLanguage]} (one short sentence) that you are ready to continue in ${LANGUAGE_LABELS[payload.switchLanguage]}, and answer my next questions in ${LANGUAGE_LABELS[payload.switchLanguage]}.`
+        : payload.text?.trim();
+
+      if (!promptText) return;
+
       if (
-        transportModeRef.current === "ws" &&
+        transportModeRef.current === "gemini-ws" &&
+        wsReadyRef.current &&
         wsRef.current &&
         wsRef.current.readyState === WebSocket.OPEN
       ) {
-        wsRef.current.send(JSON.stringify(payload));
+        micStreamReadyRef.current = false;
+        wsRef.current.send(
+          JSON.stringify({
+            clientContent: {
+              turns: [{ role: "user", parts: [{ text: promptText }] }],
+              turnComplete: true,
+            },
+          })
+        );
+        if (micEnableTimerRef.current !== null) {
+          window.clearTimeout(micEnableTimerRef.current);
+        }
+        micEnableTimerRef.current = window.setTimeout(() => {
+          micStreamReadyRef.current = true;
+          micEnableTimerRef.current = null;
+        }, 450);
         return;
       }
 
@@ -402,40 +470,21 @@ export function useVoiceAgent() {
 
   const startHttpFallbackSession = useCallback(
     async (activeVoice: VoicePersona, activeLang: VoiceLanguage) => {
-      let parsed: {
-        ok: boolean;
-        status: number;
-        data: { sessionId?: string; error?: string } | null;
-        rawText: string;
-      } | null = null;
+      const startRes = await fetch("/api/live/start", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ voice: activeVoice, lang: activeLang }),
+      });
+      const parsed = await readJsonSafe<{ sessionId?: string; error?: string }>(
+        startRes
+      );
 
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const startRes = await fetch("/api/live/start", {
-          method: "POST",
-          credentials: "same-origin",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ voice: activeVoice, lang: activeLang }),
-        });
-        parsed = await readJsonSafe<{ sessionId?: string; error?: string }>(
-          startRes
+      if (!parsed.ok || !parsed.data?.sessionId) {
+        throw new Error(
+          parsed.data?.error ||
+            "Unable to establish the real-time voice connection right now. Please try written questions below."
         );
-        if (parsed.data) break;
-        if (attempt === 0) {
-          await new Promise((r) => setTimeout(r, 1000));
-        }
-      }
-
-      if (!parsed || !parsed.ok || !parsed.data?.sessionId) {
-        const detail =
-          parsed && !parsed.data && parsed.rawText
-            ? ` (HTTP ${parsed.status}: ${parsed.rawText.slice(0, 140).replace(/\s+/g, " ").trim()})`
-            : parsed
-              ? ` (HTTP ${parsed.status})`
-              : "";
-        const friendlyError =
-          parsed?.data?.error ||
-          `Unable to reach the voice server${detail}. Please try written questions below.`;
-        throw new Error(friendlyError);
       }
 
       const sessionId = parsed.data.sessionId;
@@ -445,12 +494,12 @@ export function useVoiceAgent() {
         }).catch(() => {});
         return;
       }
+
       httpSessionIdRef.current = sessionId;
       transportModeRef.current = "http";
 
       const abortController = new AbortController();
       httpAbortRef.current = abortController;
-
       setStatus("connected");
 
       void (async () => {
@@ -514,6 +563,171 @@ export function useVoiceAgent() {
       })();
     },
     [cleanupAudioAndTransport, handleServerEvent]
+  );
+
+  const connectWithEphemeralToken = useCallback(
+    async (activeVoice: VoicePersona, activeLang: VoiceLanguage) => {
+      const tokenRes = await fetch("/api/live-token", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ voice: activeVoice, lang: activeLang }),
+      });
+
+      const parsed = await readJsonSafe<{
+        token?: string;
+        greetingPrompt?: string;
+        error?: string;
+      }>(tokenRes);
+
+      if (!parsed.ok || !parsed.data?.token) {
+        const detail =
+          parsed.data?.error ||
+          `Unable to initialize the voice session (HTTP ${parsed.status}).`;
+        throw new Error(detail);
+      }
+
+      if (statusRef.current === "idle") {
+        return;
+      }
+
+      const { token, greetingPrompt } = parsed.data;
+      const wsUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained?access_token=${encodeURIComponent(token)}`;
+
+      await new Promise<void>((resolve, reject) => {
+        const ws = new WebSocket(wsUrl);
+        wsRef.current = ws;
+        wsReadyRef.current = false;
+        let settled = false;
+
+        ws.onopen = () => {
+          transportModeRef.current = "gemini-ws";
+          ws.send(
+            JSON.stringify({
+              setup: {
+                model: "models/gemini-3.8-live",
+              },
+            })
+          );
+        };
+
+        ws.onmessage = (event) => {
+          wsMessageQueueRef.current = wsMessageQueueRef.current.then(async () => {
+            try {
+              const rawText = await decodeWsPayload(event.data);
+              if (!rawText) return;
+              const msg = JSON.parse(rawText) as GeminiBidiMessage;
+
+              if (msg.error) {
+                const errText =
+                  msg.error.message || "Voice connection encountered an error.";
+                if (!settled) {
+                  settled = true;
+                  reject(new Error(errText));
+                  return;
+                }
+                handleServerEvent({ error: errText });
+                return;
+              }
+
+              if (msg.setupComplete) {
+                wsReadyRef.current = true;
+                setStatus("connected");
+                if (greetingPrompt && ws.readyState === WebSocket.OPEN) {
+                  micStreamReadyRef.current = false;
+                  ws.send(
+                    JSON.stringify({
+                      clientContent: {
+                        turns: [
+                          { role: "user", parts: [{ text: greetingPrompt }] },
+                        ],
+                        turnComplete: true,
+                      },
+                    })
+                  );
+                  if (micEnableTimerRef.current !== null) {
+                    window.clearTimeout(micEnableTimerRef.current);
+                  }
+                  micEnableTimerRef.current = window.setTimeout(() => {
+                    micStreamReadyRef.current = true;
+                    micEnableTimerRef.current = null;
+                  }, 700);
+                } else {
+                  micStreamReadyRef.current = true;
+                }
+                if (!settled) {
+                  settled = true;
+                  resolve();
+                }
+              }
+
+              const content = msg.serverContent;
+              if (!content) return;
+
+              if (content.interrupted) {
+                handleServerEvent({ interrupted: true });
+              }
+              if (content.inputTranscription?.text) {
+                handleServerEvent({
+                  inputTranscript: content.inputTranscription.text,
+                });
+              }
+              if (content.outputTranscription?.text) {
+                handleServerEvent({
+                  outputTranscript: content.outputTranscription.text,
+                });
+              }
+              for (const part of content.modelTurn?.parts ?? []) {
+                if (part.inlineData?.data) {
+                  handleServerEvent({ audio: part.inlineData.data });
+                }
+              }
+              if (content.turnComplete) {
+                handleServerEvent({ turnComplete: true });
+              }
+            } catch {
+              // Ignore unparseable frames
+            }
+          });
+        };
+
+        ws.onerror = () => {
+          if (!settled) {
+            settled = true;
+            reject(
+              new Error("Unable to establish the real-time voice WebSocket.")
+            );
+          } else if (wsRef.current === ws && statusRef.current === "connected") {
+            setErrorMessage(
+              "The voice connection was interrupted. Please start a new session or use written questions below."
+            );
+            setStatus("error");
+            cleanupAudioAndTransport();
+          }
+        };
+
+        ws.onclose = (closeEvent) => {
+          wsReadyRef.current = false;
+          if (!settled) {
+            settled = true;
+            const reason = closeEvent.reason
+              ? `: ${closeEvent.reason}`
+              : "";
+            reject(
+              new Error(`Voice connection closed before ready${reason}.`)
+            );
+            return;
+          }
+          if (wsRef.current === ws) {
+            finalizeStreamingTurn();
+            if (statusRef.current !== "error") {
+              setStatus("idle");
+            }
+            cleanupAudioAndTransport();
+          }
+        };
+      });
+    },
+    [cleanupAudioAndTransport, finalizeStreamingTurn, handleServerEvent]
   );
 
   const startSession = useCallback(
@@ -589,12 +803,23 @@ export function useVoiceAgent() {
           const pcm16k = downsampleTo16k(rawChannel, inputCtx.sampleRate);
 
           if (
-            transportModeRef.current === "ws" &&
+            transportModeRef.current === "gemini-ws" &&
+            wsReadyRef.current &&
+            micStreamReadyRef.current &&
             wsRef.current &&
             wsRef.current.readyState === WebSocket.OPEN
           ) {
             const base64Audio = float32ToPcm16Base64(pcm16k);
-            wsRef.current.send(JSON.stringify({ audio: base64Audio }));
+            wsRef.current.send(
+              JSON.stringify({
+                realtimeInput: {
+                  audio: {
+                    data: base64Audio,
+                    mimeType: "audio/pcm;rate=16000",
+                  },
+                },
+              })
+            );
           } else if (
             transportModeRef.current === "http" &&
             httpSessionIdRef.current
@@ -621,87 +846,31 @@ export function useVoiceAgent() {
         };
         animFrameRef.current = requestAnimationFrame(updateMeter);
 
-        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const ws = new WebSocket(
-          `${protocol}//${window.location.host}/live?voice=${encodeURIComponent(activeVoice)}&lang=${encodeURIComponent(activeLang)}`
-        );
-        wsRef.current = ws;
-
-        let wsReady = false;
-        let fellBackToHttp = false;
-
-        const triggerHttpFallback = async () => {
-          if (fellBackToHttp || statusRef.current === "idle") return;
-          fellBackToHttp = true;
-          wsRef.current = null;
-          try {
-            ws.close();
-          } catch {
-            // Ignore close errors
+        try {
+          await connectWithEphemeralToken(activeVoice, activeLang);
+        } catch (tokenErr) {
+          const errMsg =
+            tokenErr instanceof Error ? tokenErr.message : String(tokenErr);
+          const isConfigError =
+            errMsg.includes("GEMINI_API_KEY") ||
+            errMsg.includes("not configured");
+          if (isConfigError) {
+            throw tokenErr;
           }
+          // Try Express HTTP SSE fallback when running on Node server
           try {
             await startHttpFallbackSession(activeVoice, activeLang);
-          } catch (err) {
-            setErrorMessage(
-              err instanceof Error
-                ? err.message
-                : "Unable to establish the real-time voice connection."
-            );
-            setStatus("error");
-            cleanupAudioAndTransport();
-          }
-        };
-
-        ws.onopen = () => {
-          transportModeRef.current = "ws";
-        };
-
-        ws.onmessage = (event) => {
-          try {
-            const msg = JSON.parse(event.data) as LiveServerEvent;
-            if (msg.ready) {
-              wsReady = true;
-            }
-            handleServerEvent(msg);
           } catch {
-            // Ignore unparseable frames
+            throw tokenErr;
           }
-        };
-
-        ws.onerror = () => {
-          if (!wsReady && !fellBackToHttp) {
-            void triggerHttpFallback();
-            return;
-          }
-          if (!fellBackToHttp) {
-            setErrorMessage(
-              "Unable to establish the real-time voice connection. Please verify microphone access or try text mode."
-            );
-            setStatus("error");
-            cleanupAudioAndTransport();
-          }
-        };
-
-        ws.onclose = () => {
-          if (!wsReady && !fellBackToHttp && statusRef.current === "connecting") {
-            void triggerHttpFallback();
-            return;
-          }
-          if (!fellBackToHttp && transportModeRef.current === "ws") {
-            finalizeStreamingTurn();
-            if (statusRef.current !== "error") {
-              setStatus("idle");
-            }
-            cleanupAudioAndTransport();
-          }
-        };
+        }
       } catch (err) {
         const message =
           err instanceof Error && err.name === "NotAllowedError"
             ? "Microphone permission was declined. Please allow microphone access to speak, or ask a question in writing below."
             : err instanceof Error
               ? err.message
-              : "Could not access your microphone.";
+              : "Could not start the voice session.";
         setErrorMessage(message);
         setStatus("error");
         cleanupAudioAndTransport();
@@ -709,9 +878,8 @@ export function useVoiceAgent() {
     },
     [
       cleanupAudioAndTransport,
-      finalizeStreamingTurn,
+      connectWithEphemeralToken,
       flushHttpAudio,
-      handleServerEvent,
       startHttpFallbackSession,
       voiceName,
     ]
