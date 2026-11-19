@@ -412,6 +412,7 @@ export function useVoiceAgent() {
       for (let attempt = 0; attempt < 2; attempt++) {
         const startRes = await fetch("/api/live/start", {
           method: "POST",
+          credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ voice: activeVoice, lang: activeLang }),
         });
@@ -425,9 +426,15 @@ export function useVoiceAgent() {
       }
 
       if (!parsed || !parsed.ok || !parsed.data?.sessionId) {
+        const detail =
+          parsed && !parsed.data && parsed.rawText
+            ? ` (HTTP ${parsed.status}: ${parsed.rawText.slice(0, 140).replace(/\s+/g, " ").trim()})`
+            : parsed
+              ? ` (HTTP ${parsed.status})`
+              : "";
         const friendlyError =
           parsed?.data?.error ||
-          "The voice server is briefly reloading or unreachable. Please refresh the page or try written questions below.";
+          `Unable to reach the voice server${detail}. Please try written questions below.`;
         throw new Error(friendlyError);
       }
 
