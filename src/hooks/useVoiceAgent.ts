@@ -23,6 +23,16 @@ interface LiveServerEvent {
   sessionClosed?: boolean;
 }
 
+async function readJsonSafe<T>(res: Response): Promise<{ ok: boolean; status: number; data: T | null; rawText: string }> {
+  const rawText = await res.text();
+  try {
+    const data = JSON.parse(rawText) as T;
+    return { ok: res.ok, status: res.status, data, rawText };
+  } catch {
+    return { ok: false, status: res.status, data: null, rawText };
+  }
+}
+
 function downsampleTo16k(input: Float32Array, inputSampleRate: number): Float32Array {
   if (inputSampleRate === 16000) return input;
   const ratio = inputSampleRate / 16000;
@@ -392,24 +402,36 @@ export function useVoiceAgent() {
 
   const startHttpFallbackSession = useCallback(
     async (activeVoice: VoicePersona, activeLang: VoiceLanguage) => {
-      const startRes = await fetch("/api/live/start", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ voice: activeVoice, lang: activeLang }),
-      });
+      let parsed: {
+        ok: boolean;
+        status: number;
+        data: { sessionId?: string; error?: string } | null;
+        rawText: string;
+      } | null = null;
 
-      const startData = (await startRes.json()) as {
-        sessionId?: string;
-        error?: string;
-      };
-
-      if (!startRes.ok || !startData.sessionId) {
-        throw new Error(
-          startData.error || "Unable to initialize the voice session."
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const startRes = await fetch("/api/live/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ voice: activeVoice, lang: activeLang }),
+        });
+        parsed = await readJsonSafe<{ sessionId?: string; error?: string }>(
+          startRes
         );
+        if (parsed.data) break;
+        if (attempt === 0) {
+          await new Promise((r) => setTimeout(r, 1000));
+        }
       }
 
-      const sessionId = startData.sessionId;
+      if (!parsed || !parsed.ok || !parsed.data?.sessionId) {
+        const friendlyError =
+          parsed?.data?.error ||
+          "The voice server is briefly reloading or unreachable. Please refresh the page or try written questions below.";
+        throw new Error(friendlyError);
+      }
+
+      const sessionId = parsed.data.sessionId;
       if (statusRef.current === "idle") {
         fetch(`/api/live/stop/${encodeURIComponent(sessionId)}`, {
           method: "POST",
@@ -424,7 +446,6 @@ export function useVoiceAgent() {
 
       setStatus("connected");
 
-      // Read SSE stream via fetch (proxied seamlessly through AI Studio iframe bridge)
       void (async () => {
         try {
           const streamRes = await fetch(
@@ -457,8 +478,8 @@ export function useVoiceAgent() {
                   const jsonStr = line.slice(5).trim();
                   if (!jsonStr) continue;
                   try {
-                    const parsed = JSON.parse(jsonStr) as LiveServerEvent;
-                    handleServerEvent(parsed);
+                    const msg = JSON.parse(jsonStr) as LiveServerEvent;
+                    handleServerEvent(msg);
                   } catch {
                     // Ignore malformed SSE lines
                   }
@@ -467,13 +488,13 @@ export function useVoiceAgent() {
             }
           }
         } catch (err) {
-          if (
-            err instanceof Error &&
-            err.name === "AbortError"
-          ) {
+          if (err instanceof Error && err.name === "AbortError") {
             return;
           }
-          if (statusRef.current === "connected" || statusRef.current === "connecting") {
+          if (
+            statusRef.current === "connected" ||
+            statusRef.current === "connecting"
+          ) {
             setErrorMessage(
               err instanceof Error
                 ? err.message
@@ -534,7 +555,6 @@ export function useVoiceAgent() {
         outputCtxRef.current = outputCtx;
         analyserRef.current = analyser;
 
-        // Wire mic processor once for whichever transport succeeds
         const source = inputCtx.createMediaStreamSource(stream);
         const processor = inputCtx.createScriptProcessor(4096, 1, 1);
         processorRef.current = processor;
@@ -594,7 +614,6 @@ export function useVoiceAgent() {
         };
         animFrameRef.current = requestAnimationFrame(updateMeter);
 
-        // Try direct WebSocket first; if blocked by iframe/proxy cookie checks before ready, fall back transparently to HTTP fetch streaming
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
         const ws = new WebSocket(
           `${protocol}//${window.location.host}/live?voice=${encodeURIComponent(activeVoice)}&lang=${encodeURIComponent(activeLang)}`
@@ -773,9 +792,15 @@ export function useVoiceAgent() {
           }),
         });
 
-        const data = (await res.json()) as { answer?: string; error?: string };
-        if (!res.ok || !data.answer) {
-          throw new Error(data.error || "Unable to retrieve an answer right now.");
+        const parsed = await readJsonSafe<{ answer?: string; error?: string }>(
+          res
+        );
+        const answer = parsed.data?.answer;
+        if (!parsed.ok || !answer) {
+          throw new Error(
+            parsed.data?.error ||
+              "Unable to reach the assistant right now. Please try again in a moment."
+          );
         }
 
         setTranscript((prev) => [
@@ -783,7 +808,7 @@ export function useVoiceAgent() {
           {
             id: `${Date.now()}-a`,
             role: "agent",
-            text: data.answer!,
+            text: answer,
             mode: "text",
           },
         ]);
