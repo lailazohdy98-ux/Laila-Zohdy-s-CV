@@ -3,7 +3,8 @@ import { GoogleGenAI, Modality, ThinkingLevel } from "@google/genai";
 export const ALLOWED_VOICES = new Set(["Kore", "Zephyr"]);
 export const ALLOWED_LANGS = new Set(["en", "fr", "ar"]);
 
-export const LANGUAGE_LABELS: Record<string, string> = {
+/** @type {Record<string, string>} */
+export const LANGUAGE_LABELS = {
   en: "English",
   fr: "French",
   ar: "Arabic",
@@ -89,17 +90,17 @@ SKILLS & TOOLS:
 - AI Tools: Claude, ChatGPT (daily use for research, drafting, and workflow acceleration).
 - Languages: English (bilingual), Arabic (bilingual), French (B2 / intermediate).`;
 
-export function normalizeVoice(requested?: unknown): string {
+export function normalizeVoice(requested) {
   const voice = typeof requested === "string" ? requested : "Kore";
   return ALLOWED_VOICES.has(voice) ? voice : "Kore";
 }
 
-export function normalizeLang(requested?: unknown): string {
+export function normalizeLang(requested) {
   const lang = typeof requested === "string" ? requested : "en";
   return ALLOWED_LANGS.has(lang) ? lang : "en";
 }
 
-export function buildGreetingPrompt(lang: string): string {
+export function buildGreetingPrompt(lang) {
   if (lang === "fr") {
     return "Briefly greet the recruiter in natural, professional French in one or two warm sentences as Laila Zohdy's interactive voice resume, and invite them to ask about her experience, results, or skills in French, English, or Arabic.";
   }
@@ -109,12 +110,7 @@ export function buildGreetingPrompt(lang: string): string {
   return "Briefly greet the recruiter in English in one or two warm, professional sentences as Laila Zohdy's interactive voice resume, and invite them to ask about her experience, results, or skills in English, French, or Arabic.";
 }
 
-export async function generateResumeAnswer(params: {
-  apiKey: string;
-  question: string;
-  history?: Array<{ role?: string; text?: string }>;
-  language?: string;
-}): Promise<string> {
+export async function generateResumeAnswer(params) {
   const ai = new GoogleGenAI({
     apiKey: params.apiKey,
     httpOptions: {
@@ -137,21 +133,21 @@ export async function generateResumeAnswer(params: {
       )
       .slice(-10)
       .map((item) => ({
-        role: item.role as "user" | "model",
-        parts: [{ text: item.text! }],
+        role: item.role,
+        parts: [{ text: item.text }],
       })),
-    { role: "user" as const, parts: [{ text: params.question.trim() }] },
+    { role: "user", parts: [{ text: params.question.trim() }] },
   ];
 
   const langNote = `\nPreferred default language for this session: ${LANGUAGE_LABELS[activeLang]}. If the user writes in English, French, or Arabic, respond in the language of their question.`;
 
-  const attempts: Array<{ model: string; thinkingLevel: ThinkingLevel }> = [
+  const attempts = [
     { model: "gemini-4-hydrogen", thinkingLevel: ThinkingLevel.LOW },
     { model: "gemini-3.1-flash-lite", thinkingLevel: ThinkingLevel.MINIMAL },
   ];
 
   let response;
-  let lastErr: unknown = null;
+  let lastErr = null;
   for (const attempt of attempts) {
     try {
       response = await ai.models.generateContent({
@@ -181,11 +177,7 @@ export async function generateResumeAnswer(params: {
   return answer;
 }
 
-export async function mintLiveVoiceToken(params: {
-  apiKey: string;
-  voice?: unknown;
-  lang?: unknown;
-}) {
+export async function mintLiveVoiceToken(params) {
   const voiceName = normalizeVoice(params.voice);
   const activeLang = normalizeLang(params.lang);
 

@@ -1,32 +1,27 @@
-import type { IncomingMessage, ServerResponse } from "http";
-import { mintLiveVoiceToken } from "../shared/resumeAssistant";
+import { mintLiveVoiceToken } from "../shared/resumeAssistant.mjs";
 
-interface VercelRequest extends IncomingMessage {
-  body?: unknown;
-}
-
-function sendJson(res: ServerResponse, statusCode: number, data: unknown) {
+function sendJson(res, statusCode, data) {
   res.statusCode = statusCode;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.end(JSON.stringify(data));
 }
 
-async function readBody(req: VercelRequest): Promise<Record<string, unknown>> {
+async function readBody(req) {
   if (req.body && typeof req.body === "object") {
-    return req.body as Record<string, unknown>;
+    return req.body;
   }
   if (typeof req.body === "string") {
-    return JSON.parse(req.body || "{}") as Record<string, unknown>;
+    return req.body ? JSON.parse(req.body) : {};
   }
-  const chunks: Buffer[] = [];
+  const chunks = [];
   for await (const chunk of req) {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   }
-  const raw = Buffer.concat(chunks).toString("utf8");
-  return raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+  const raw = Buffer.concat(chunks).toString("utf8").trim();
+  return raw ? JSON.parse(raw) : {};
 }
 
-export default async function handler(req: VercelRequest, res: ServerResponse) {
+export default async function handler(req, res) {
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "Method not allowed." });
     return;
@@ -44,8 +39,8 @@ export default async function handler(req: VercelRequest, res: ServerResponse) {
     const body = await readBody(req);
     const result = await mintLiveVoiceToken({
       apiKey,
-      voice: body.voice,
-      lang: body.lang,
+      voice: body?.voice,
+      lang: body?.lang,
     });
     sendJson(res, 200, result);
   } catch (err) {

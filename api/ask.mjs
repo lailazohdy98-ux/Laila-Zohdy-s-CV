@@ -1,32 +1,27 @@
-import type { IncomingMessage, ServerResponse } from "http";
-import { generateResumeAnswer } from "../shared/resumeAssistant";
+import { generateResumeAnswer } from "../shared/resumeAssistant.mjs";
 
-interface VercelRequest extends IncomingMessage {
-  body?: unknown;
-}
-
-function sendJson(res: ServerResponse, statusCode: number, data: unknown) {
+function sendJson(res, statusCode, data) {
   res.statusCode = statusCode;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.end(JSON.stringify(data));
 }
 
-async function readBody(req: VercelRequest): Promise<Record<string, unknown>> {
+async function readBody(req) {
   if (req.body && typeof req.body === "object") {
-    return req.body as Record<string, unknown>;
+    return req.body;
   }
   if (typeof req.body === "string") {
-    return JSON.parse(req.body || "{}") as Record<string, unknown>;
+    return req.body ? JSON.parse(req.body) : {};
   }
-  const chunks: Buffer[] = [];
+  const chunks = [];
   for await (const chunk of req) {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   }
-  const raw = Buffer.concat(chunks).toString("utf8");
-  return raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+  const raw = Buffer.concat(chunks).toString("utf8").trim();
+  return raw ? JSON.parse(raw) : {};
 }
 
-export default async function handler(req: VercelRequest, res: ServerResponse) {
+export default async function handler(req, res) {
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "Method not allowed." });
     return;
@@ -43,7 +38,7 @@ export default async function handler(req: VercelRequest, res: ServerResponse) {
   try {
     const body = await readBody(req);
     const question =
-      typeof body.question === "string" ? body.question.trim() : "";
+      typeof body?.question === "string" ? body.question.trim() : "";
     if (!question) {
       sendJson(res, 400, { error: "Please enter a question to ask." });
       return;
@@ -52,8 +47,8 @@ export default async function handler(req: VercelRequest, res: ServerResponse) {
     const answer = await generateResumeAnswer({
       apiKey,
       question,
-      history: Array.isArray(body.history) ? body.history : [],
-      language: typeof body.language === "string" ? body.language : "en",
+      history: Array.isArray(body?.history) ? body.history : [],
+      language: typeof body?.language === "string" ? body.language : "en",
     });
 
     sendJson(res, 200, { answer });

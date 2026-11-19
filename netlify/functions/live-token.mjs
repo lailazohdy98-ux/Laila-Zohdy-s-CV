@@ -1,11 +1,6 @@
-import { mintLiveVoiceToken } from "../../shared/resumeAssistant";
+import { mintLiveVoiceToken } from "../../shared/resumeAssistant.mjs";
 
-interface NetlifyEvent {
-  httpMethod: string;
-  body: string | null;
-}
-
-export const handler = async (event: NetlifyEvent) => {
+export const handler = async (event) => {
   const headers = { "Content-Type": "application/json; charset=utf-8" };
 
   if (event.httpMethod !== "POST") {
@@ -28,14 +23,11 @@ export const handler = async (event: NetlifyEvent) => {
   }
 
   try {
-    const body = JSON.parse(event.body || "{}") as {
-      voice?: unknown;
-      lang?: unknown;
-    };
+    const body = JSON.parse(event.body || "{}");
     const result = await mintLiveVoiceToken({
       apiKey,
-      voice: body.voice,
-      lang: body.lang,
+      voice: body?.voice,
+      lang: body?.lang,
     });
     return {
       statusCode: 200,

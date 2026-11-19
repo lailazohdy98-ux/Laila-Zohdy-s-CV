@@ -16,7 +16,7 @@ import {
   buildGreetingPrompt,
   generateResumeAnswer,
   mintLiveVoiceToken,
-} from "./shared/resumeAssistant.ts";
+} from "./shared/resumeAssistant.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

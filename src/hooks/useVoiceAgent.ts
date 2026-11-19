@@ -580,9 +580,13 @@ export function useVoiceAgent() {
       }>(tokenRes);
 
       if (!parsed.ok || !parsed.data?.token) {
+        const rawSnippet =
+          !parsed.data && parsed.rawText
+            ? `: ${parsed.rawText.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 120)}`
+            : "";
         const detail =
           parsed.data?.error ||
-          `Unable to initialize the voice session (HTTP ${parsed.status}).`;
+          `Unable to initialize the voice session (HTTP ${parsed.status}${rawSnippet}).`;
         throw new Error(detail);
       }
 

@@ -1,11 +1,6 @@
-import { generateResumeAnswer } from "../../shared/resumeAssistant";
+import { generateResumeAnswer } from "../../shared/resumeAssistant.mjs";
 
-interface NetlifyEvent {
-  httpMethod: string;
-  body: string | null;
-}
-
-export const handler = async (event: NetlifyEvent) => {
+export const handler = async (event) => {
   const headers = { "Content-Type": "application/json; charset=utf-8" };
 
   if (event.httpMethod !== "POST") {
@@ -28,13 +23,9 @@ export const handler = async (event: NetlifyEvent) => {
   }
 
   try {
-    const body = JSON.parse(event.body || "{}") as {
-      question?: unknown;
-      history?: Array<{ role?: string; text?: string }>;
-      language?: string;
-    };
+    const body = JSON.parse(event.body || "{}");
     const question =
-      typeof body.question === "string" ? body.question.trim() : "";
+      typeof body?.question === "string" ? body.question.trim() : "";
 
     if (!question) {
       return {
@@ -47,8 +38,8 @@ export const handler = async (event: NetlifyEvent) => {
     const answer = await generateResumeAnswer({
       apiKey,
       question,
-      history: Array.isArray(body.history) ? body.history : [],
-      language: typeof body.language === "string" ? body.language : "en",
+      history: Array.isArray(body?.history) ? body.history : [],
+      language: typeof body?.language === "string" ? body.language : "en",
     });
 
     return {
